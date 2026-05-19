@@ -53,6 +53,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -86,6 +88,8 @@ class MainActivity : AppCompatActivity() {
     private var reconnectJob: Job? = null
     private var timeJob: Job? = null
     private var client: MqttClient? = null
+    private var connectOptions: MqttConnectOptions? = null
+    private val mqttCleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val host = "tcp://47.109.89.8:1883"
     private val userName = "root23"
     private val passWord = "root34"
@@ -132,7 +136,7 @@ class MainActivity : AppCompatActivity() {
         reconnectJob?.cancel()
         timeJob?.cancel()
         loginDialog?.dismiss()
-        lifecycleScope.launch(Dispatchers.IO) {
+        mqttCleanupScope.launch {
             try {
                 if (client?.isConnected == true) {
                     client?.disconnect()
@@ -144,7 +148,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showLoginDialog(onSuccess: Runnable) {
+    private fun showLoginDialog(onSuccess: () -> Unit) {
         val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_login, null)
         val etUsername = dialogView.findViewById<EditText>(R.id.et_username)
         val etPassword = dialogView.findViewById<EditText>(R.id.et_password)
@@ -186,7 +190,7 @@ class MainActivity : AppCompatActivity() {
                     mqttSubTopic = username
                     mqttPubTopic = password
                     loginDialog?.dismiss()
-                    onSuccess.run()
+                    onSuccess()
                 }
             }
         }
@@ -210,12 +214,13 @@ class MainActivity : AppCompatActivity() {
         try {
             client = MqttClient(host, mqttClientId, MemoryPersistence())
 
-            val options = MqttConnectOptions()
-            options.isCleanSession = false
-            options.userName = userName
-            options.password = passWord.toCharArray()
-            options.connectionTimeout = 10
-            options.keepAliveInterval = 20
+            connectOptions = MqttConnectOptions().apply {
+                isCleanSession = false
+                userName = this@MainActivity.userName
+                password = passWord.toCharArray()
+                connectionTimeout = 10
+                keepAliveInterval = 20
+            }
 
             client?.setCallback(object : MqttCallback {
                 override fun connectionLost(cause: Throwable) {
@@ -255,7 +260,7 @@ class MainActivity : AppCompatActivity() {
     private suspend fun Mqtt_connect() {
         try {
             if (client?.isConnected != true) {
-                client?.connect(null as MqttConnectOptions?)
+                client?.connect(connectOptions)
                 withContext(Dispatchers.Main) {
                     Toast.makeText(this@MainActivity, "MQTT服务器连接成功,等待硬件数据上报", Toast.LENGTH_SHORT).show()
                 }
@@ -374,7 +379,7 @@ private fun SmartHomeScreen(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = "智能手环",
+                        text = "李飞龙的智能手环",
                         color = Color.White,
                         fontSize = 20.sp,
                     )
