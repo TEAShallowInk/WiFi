@@ -1,12 +1,8 @@
 package cacom.example.smarthome
 
-import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.content.SharedPreferences
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.os.Message
 import android.util.Log
 import android.view.LayoutInflater
 import android.widget.Button
@@ -54,6 +50,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
 import org.eclipse.paho.client.mqttv3.MqttCallback
 import org.eclipse.paho.client.mqttv3.MqttClient
@@ -64,9 +67,6 @@ import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import org.json.JSONException
 import org.json.JSONObject
 import java.util.Calendar
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
 
@@ -82,27 +82,17 @@ class MainActivity : AppCompatActivity() {
 
     private var timeString = ""
     private var dateString = ""
-    private val math = ((Math.random() * 9 + 1) * 10000).toInt()
-    private val mqttId = "sadjk$math"
-    private var scheduler: ScheduledExecutorService? = null
+    private val mqttClientId = "sadjk${((Math.random() * 9 + 1) * 10000).toInt()}"
+    private var reconnectJob: Job? = null
+    private var timeJob: Job? = null
     private var client: MqttClient? = null
-    private lateinit var handler: Handler
     private val host = "tcp://47.109.89.8:1883"
     private val userName = "root23"
     private val passWord = "root34"
-    private val mqttClientId = mqttId
     private var mqttSubTopic = ""
     private var mqttPubTopic = ""
     private lateinit var sharedPreferences: SharedPreferences
     private var loginDialog: AlertDialog? = null
-    private val msg = Message()
-
-    private val timeHandler = object : Handler(Looper.getMainLooper()) {
-        override fun handleMessage(msg: Message) {
-            super.handleMessage(msg)
-            updateTime()
-        }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -131,10 +121,27 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
+        startTimeUpdates()
         showLoginDialog {
             initializeAfterLogin()
         }
-        updateTime()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        reconnectJob?.cancel()
+        timeJob?.cancel()
+        loginDialog?.dismiss()
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                if (client?.isConnected == true) {
+                    client?.disconnect()
+                }
+                client?.close()
+            } catch (e: MqttException) {
+                e.printStackTrace()
+            }
+        }
     }
 
     private fun showLoginDialog(onSuccess: Runnable) {
@@ -192,38 +199,9 @@ class MainActivity : AppCompatActivity() {
             .putString("username", username)
             .putString("password", password)
             .apply()
-        showSavedData()
-    }
-
-    private fun showSavedData() {
-        sharedPreferences.getString("username", "未保存")
-        sharedPreferences.getString("password", "未保存")
     }
 
     private fun initializeAfterLogin() {
-        handler = object : Handler(Looper.getMainLooper()) {
-            @SuppressLint("SetTextI18n")
-            override fun handleMessage(msg: Message) {
-                super.handleMessage(msg)
-                when (msg.what) {
-                    1 -> Unit
-                    2 -> Unit
-                    3 -> {
-                        println(msg.obj.toString())
-                        parseJsonobj(msg.obj.toString())
-                    }
-                    30 -> Toast.makeText(this@MainActivity, "MQTT服务器连接失败", Toast.LENGTH_SHORT).show()
-                    31 -> {
-                        Toast.makeText(this@MainActivity, "MQTT服务器连接成功,等待硬件数据上报", Toast.LENGTH_SHORT).show()
-                        try {
-                            client?.subscribe(mqttSubTopic, 0)
-                        } catch (e: MqttException) {
-                            e.printStackTrace()
-                        }
-                    }
-                }
-            }
-        }
         Mqtt_init()
         startReconnect()
     }
@@ -250,10 +228,11 @@ class MainActivity : AppCompatActivity() {
 
                 override fun messageArrived(topicName: String, message: MqttMessage) {
                     println("messageArrived----------")
-                    val mqttMessage = Message()
-                    mqttMessage.what = 3
-                    mqttMessage.obj = message.toString()
-                    handler.sendMessage(mqttMessage)
+                    val payload = message.toString()
+                    lifecycleScope.launch(Dispatchers.Main) {
+                        println(payload)
+                        parseJsonobj(payload)
+                    }
                 }
             })
         } catch (e: Exception) {
@@ -261,47 +240,45 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun Mqtt_connect() {
-        Thread {
-            try {
-                if (client?.isConnected != true) {
-                    val options: MqttConnectOptions? = null
-                    client?.connect(options)
-                    val message = Message()
-                    message.what = 31
-                    handler.sendMessage(message)
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                handler.sendMessage(msg)
-            }
-        }.start()
-    }
-
     private fun startReconnect() {
-        scheduler = Executors.newSingleThreadScheduledExecutor()
-        scheduler?.scheduleAtFixedRate(
-            {
+        reconnectJob?.cancel()
+        reconnectJob = lifecycleScope.launch(Dispatchers.IO) {
+            while (isActive) {
                 if (client?.isConnected != true) {
                     Mqtt_connect()
                 }
-            },
-            0,
-            10 * 1000,
-            TimeUnit.MILLISECONDS,
-        )
+                delay(10_000)
+            }
+        }
+    }
+
+    private suspend fun Mqtt_connect() {
+        try {
+            if (client?.isConnected != true) {
+                client?.connect(null as MqttConnectOptions?)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "MQTT服务器连接成功,等待硬件数据上报", Toast.LENGTH_SHORT).show()
+                }
+                client?.subscribe(mqttSubTopic, 0)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity, "MQTT服务器连接失败", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     private fun publishmessageplus(topic: String, message2: String) {
-        if (client == null || client?.isConnected != true) {
-            return
-        }
-        val message = MqttMessage()
-        message.payload = message2.toByteArray()
-        try {
-            client?.publish(topic, message2.toByteArray(), 0, false)
-        } catch (e: MqttException) {
-            e.printStackTrace()
+        lifecycleScope.launch(Dispatchers.IO) {
+            if (client == null || client?.isConnected != true) {
+                return@launch
+            }
+            try {
+                client?.publish(topic, message2.toByteArray(), 0, false)
+            } catch (e: MqttException) {
+                e.printStackTrace()
+            }
         }
     }
 
@@ -325,6 +302,16 @@ class MainActivity : AppCompatActivity() {
             tempThreshold = sensor7
         } catch (e: JSONException) {
             e.printStackTrace()
+        }
+    }
+
+    private fun startTimeUpdates() {
+        timeJob?.cancel()
+        timeJob = lifecycleScope.launch {
+            while (isActive) {
+                updateTime()
+                delay(1000)
+            }
         }
     }
 
@@ -352,7 +339,6 @@ class MainActivity : AppCompatActivity() {
         dateString = year.toString() + monthStr + dayStr
         Log.e("aaa", dateString)
         timeShow = "$t1\r\n$t\r\n$dayName"
-        timeHandler.sendEmptyMessageDelayed(0, 1000)
     }
 }
 
